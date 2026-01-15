@@ -1,4 +1,4 @@
-// Billiger.de Price Comparison Scraper - CheerioCrawler implementation
+// Billiger.de Price Comparison Scraper - Fast & Stealthy CheerioCrawler
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 
@@ -31,22 +31,36 @@ async function main() {
         };
 
         const cleanPrice = (priceStr) => {
-            if (!priceStr) return null;
-            const match = String(priceStr).replace(/\s/g, '').match(/(\d+[.,]?\d*)/);
+            if (!priceStr && priceStr !== 0) return null;
+            const str = String(priceStr).replace(/\s/g, '').replace(/[€EUR]/gi, '');
+            const match = str.match(/(\d+[.,]?\d*)/);
             if (match) {
                 return parseFloat(match[1].replace(',', '.'));
             }
             return null;
         };
 
-        const cleanImageUrl = (url) => {
-            if (!url) return null;
-            try {
-                const u = new URL(url);
-                return `${u.origin}${u.pathname}`;
-            } catch {
-                return url;
+        const cleanImageUrl = (imgData) => {
+            if (!imgData) return null;
+            // Handle ImageObject format
+            if (typeof imgData === 'object') {
+                if (Array.isArray(imgData)) {
+                    const first = imgData[0];
+                    if (typeof first === 'string') return first;
+                    return first?.contentUrl || first?.url || first?.thumbnailUrl || null;
+                }
+                return imgData.contentUrl || imgData.url || imgData.thumbnailUrl || null;
             }
+            return String(imgData);
+        };
+
+        const cleanShopName = (name) => {
+            if (!name) return null;
+            return name
+                .replace(/^Infos zu\s*/i, '')
+                .replace(/Shop-Informationen\s*/i, '')
+                .replace(/für\s*/i, '')
+                .trim();
         };
 
         // Extract JSON-LD data from page
@@ -71,28 +85,31 @@ async function main() {
                 if (type === 'Product' || type === 'ProductGroup') {
                     const offers = item.offers || {};
                     const aggregateRating = item.aggregateRating || {};
-                    
+
+                    // Handle AggregateOffer type
+                    let lowPrice = null, highPrice = null, offerCount = null;
+
+                    if (offers['@type'] === 'AggregateOffer') {
+                        lowPrice = cleanPrice(offers.lowPrice);
+                        highPrice = cleanPrice(offers.highPrice);
+                        offerCount = parseInt(offers.offerCount, 10) || null;
+                    } else if (offers.price) {
+                        lowPrice = cleanPrice(offers.price);
+                    }
+
                     return {
                         product_name: item.name || null,
-                        brand: item.brand?.name || item.brand || null,
+                        brand: item.brand?.name || (typeof item.brand === 'string' ? item.brand : null),
                         gtin: item.gtin13 || item.gtin || null,
                         sku: item.sku || null,
-                        lowest_price: cleanPrice(offers.lowPrice),
-                        highest_price: cleanPrice(offers.highPrice),
-                        offer_count: parseInt(offers.offerCount, 10) || null,
+                        lowest_price: lowPrice,
+                        highest_price: highPrice,
+                        offer_count: offerCount,
                         rating: parseFloat(aggregateRating.ratingValue) || null,
                         review_count: parseInt(aggregateRating.reviewCount, 10) || null,
-                        image_url: cleanImageUrl(Array.isArray(item.image) ? item.image[0] : item.image),
+                        image_url: cleanImageUrl(item.image),
                         currency: offers.priceCurrency || 'EUR',
                         description: item.description || null,
-                        variants: item.hasVariant ? item.hasVariant.map(v => ({
-                            name: v.name,
-                            sku: v.sku,
-                            gtin: v.gtin13 || v.gtin,
-                            url: v.url,
-                            lowest_price: cleanPrice(v.offers?.lowPrice),
-                            offer_count: parseInt(v.offers?.offerCount, 10) || null,
-                        })) : [],
                     };
                 }
             }
@@ -100,109 +117,150 @@ async function main() {
         }
 
         // Extract individual offers from HTML
-        function extractOffersFromHtml($) {
+        function extractOffersFromHtml($, baseUrl) {
             const offers = [];
-            
-            // Look for offer rows
-            $('[data-offer-row], .offer-row, [class*="offer-item"]').each((_, el) => {
+
+            // Find all offer containers - look for elements with price and shop info
+            $('div[class*="offer"], [data-offer-row], [class*="price-row"]').each((_, el) => {
                 const $el = $(el);
-                
-                // Extract shop name
-                const shopBtn = $el.find('button[title="Shop-Info"]');
-                let shopName = shopBtn.attr('aria-label') || '';
-                shopName = shopName.replace('Shop-Informationen', '').replace('für', '').trim();
-                
+                const text = $el.text();
+
+                // Skip if no price-like content
+                if (!text.match(/\d+[.,]\d{2}/)) return;
+
+                // Extract shop name from various sources
+                let shopName = null;
+                const shopBtn = $el.find('button[title*="Shop"]');
+                if (shopBtn.length) {
+                    shopName = shopBtn.attr('aria-label') || shopBtn.attr('title') || '';
+                }
                 if (!shopName) {
-                    shopName = $el.find('img[alt]').attr('alt') || '';
+                    const shopImg = $el.find('img[alt]').first();
+                    shopName = shopImg.attr('alt') || '';
                 }
-                
-                // Extract prices
-                const priceText = $el.text();
-                const priceMatch = priceText.match(/(\d+[.,]\d{2})\s*€/);
+                if (!shopName) {
+                    const shopLink = $el.find('a[title]').first();
+                    shopName = shopLink.attr('title') || '';
+                }
+
+                shopName = cleanShopName(shopName);
+                if (!shopName) return;
+
+                // Extract price - first number in the row
+                const priceMatch = text.match(/(\d+[.,]\d{2})\s*€/);
                 const price = priceMatch ? cleanPrice(priceMatch[1]) : null;
-                
+                if (!price) return;
+
                 // Extract shipping
-                const shippingMatch = priceText.match(/(?:ab|zzgl\.)\s*(\d+[.,]\d{2})\s*€\s*Versand/i);
+                const shippingMatch = text.match(/(?:ab|zzgl\.)\s*(\d+[.,]\d{2})\s*€\s*Versand/i);
                 const shipping = shippingMatch ? cleanPrice(shippingMatch[1]) : 0;
-                
-                // Extract total
-                const totalMatch = priceText.match(/(\d+[.,]\d{2})\s*€\s*Gesamt/i);
-                const total = totalMatch ? cleanPrice(totalMatch[1]) : (price ? price + (shipping || 0) : null);
-                
-                // Extract link
-                const link = $el.find('a[href*="redirect"]').attr('href') || $el.find('a').attr('href');
-                
-                if (shopName && price) {
-                    offers.push({
-                        shop_name: shopName.trim(),
-                        price,
-                        shipping_cost: shipping,
-                        total_price: total,
-                        offer_url: toAbs(link),
-                    });
+
+                // Extract total price if available
+                const totalMatch = text.match(/(\d+[.,]\d{2})\s*€\s*Gesamt/i);
+                const total = totalMatch ? cleanPrice(totalMatch[1]) : (price + (shipping || 0));
+
+                // Extract offer link - look for redirect links
+                let offerUrl = null;
+                const redirectLink = $el.find('a[href*="/redirect"]').attr('href');
+                if (redirectLink) {
+                    offerUrl = toAbs(redirectLink, baseUrl);
+                } else {
+                    const anyLink = $el.find('a[href^="http"]').attr('href');
+                    if (anyLink) offerUrl = anyLink;
                 }
+
+                offers.push({
+                    shop_name: shopName,
+                    price,
+                    shipping_cost: shipping,
+                    total_price: total,
+                    offer_url: offerUrl,
+                });
             });
-            
-            return offers;
+
+            // Dedupe by shop name + price
+            const seen = new Set();
+            return offers.filter(o => {
+                const key = `${o.shop_name}-${o.price}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
         }
 
         // Extract product data from HTML as fallback
         function extractProductFromHtml($, url) {
             const title = $('h1').first().text().trim();
-            const brand = $('meta[itemprop="brand"]').attr('content') || 
-                         $('[class*="brand"]').first().text().trim() || null;
-            
-            // Try to get price from various selectors
+            const brand = $('meta[itemprop="brand"]').attr('content') ||
+                $('[class*="brand"]').first().text().trim() || null;
+
+            // Get price from meta or visible elements
             let lowestPrice = null;
-            const priceEl = $('[class*="price"]').first();
-            if (priceEl.length) {
-                lowestPrice = cleanPrice(priceEl.text());
+            const priceMeta = $('meta[itemprop="lowPrice"]').attr('content');
+            if (priceMeta) {
+                lowestPrice = cleanPrice(priceMeta);
+            } else {
+                const priceEl = $('[class*="price"]').first();
+                if (priceEl.length) {
+                    lowestPrice = cleanPrice(priceEl.text());
+                }
             }
-            
+
+            // Get highest price
+            let highestPrice = null;
+            const highPriceMeta = $('meta[itemprop="highPrice"]').attr('content');
+            if (highPriceMeta) {
+                highestPrice = cleanPrice(highPriceMeta);
+            }
+
             // Get offer count
             let offerCount = null;
-            const offerText = $('[href="#offers"]').text();
-            const offerMatch = offerText.match(/(\d+)\s*Angebote?/i);
-            if (offerMatch) {
-                offerCount = parseInt(offerMatch[1], 10);
+            const offerCountMeta = $('meta[itemprop="offerCount"]').attr('content');
+            if (offerCountMeta) {
+                offerCount = parseInt(offerCountMeta, 10);
+            } else {
+                const offerText = $('[href="#offers"], [class*="offer-count"]').text();
+                const offerMatch = offerText.match(/(\d+)\s*Angebote?/i);
+                if (offerMatch) {
+                    offerCount = parseInt(offerMatch[1], 10);
+                }
             }
-            
+
             // Get image
-            const imageUrl = $('img[class*="product"]').attr('src') || 
-                            $('meta[property="og:image"]').attr('content') || null;
-            
+            const imageUrl = $('meta[property="og:image"]').attr('content') ||
+                $('img[class*="product"]').attr('src') || null;
+
             // Get rating
             let rating = null;
             let reviewCount = null;
-            const ratingEl = $('[class*="rating"]').first();
-            if (ratingEl.length) {
-                const ratingText = ratingEl.text();
-                const ratingMatch = ratingText.match(/(\d+[.,]?\d*)/);
-                if (ratingMatch) rating = parseFloat(ratingMatch[1].replace(',', '.'));
+            const ratingMeta = $('meta[itemprop="ratingValue"]').attr('content');
+            if (ratingMeta) {
+                rating = parseFloat(ratingMeta);
             }
-            
+            const reviewMeta = $('meta[itemprop="reviewCount"]').attr('content');
+            if (reviewMeta) {
+                reviewCount = parseInt(reviewMeta, 10);
+            }
+
             return {
                 product_name: title || null,
                 brand,
                 gtin: null,
                 sku: null,
                 lowest_price: lowestPrice,
-                highest_price: null,
+                highest_price: highestPrice,
                 offer_count: offerCount,
                 rating,
                 review_count: reviewCount,
-                image_url: cleanImageUrl(imageUrl),
+                image_url: imageUrl,
                 currency: 'EUR',
                 description: $('meta[name="description"]').attr('content') || null,
-                variants: [],
             };
         }
 
         // Find product links from search results
         function findProductLinks($, base) {
             const links = new Set();
-            
-            // Look for product links in search results
             $('a[href*="/pricelist/"], a[href*="/baseproducts/"], a[href*="/products/"]').each((_, a) => {
                 const href = $(a).attr('href');
                 if (!href) return;
@@ -211,26 +269,16 @@ async function main() {
                     links.add(abs);
                 }
             });
-            
             return [...links];
         }
 
         // Find next page in search results
         function findNextPage($, base) {
-            // Look for next page link
             const nextBtn = $('a[aria-label*="Nächste"], a[class*="next"], a:contains("›"), a:contains("»")').first();
             if (nextBtn.length) {
                 const href = nextBtn.attr('href');
                 if (href) return toAbs(href, base);
             }
-            
-            // Look for pagination with page numbers
-            const currentPage = $('a[aria-current="page"], .pagination .active').first();
-            if (currentPage.length) {
-                const nextSibling = currentPage.parent().next().find('a').attr('href');
-                if (nextSibling) return toAbs(nextSibling, base);
-            }
-            
             return null;
         }
 
@@ -255,7 +303,7 @@ async function main() {
             initial.push(buildSearchUrl(searchQuery));
         }
         if (!initial.length) {
-            initial.push(buildSearchUrl('laptop')); // Default search
+            initial.push(buildSearchUrl('laptop'));
         }
 
         const proxyConf = proxyConfiguration ? await Actor.createProxyConfiguration({ ...proxyConfiguration }) : undefined;
@@ -265,16 +313,14 @@ async function main() {
 
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 3,
+            maxRequestRetries: 2,
             useSessionPool: true,
-            maxConcurrency: 5,
-            requestHandlerTimeoutSecs: 60,
-            additionalMimeTypes: ['application/json'],
+            maxConcurrency: 10,
+            requestHandlerTimeoutSecs: 30,
+            navigationTimeoutSecs: 20,
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
                 const urlType = getUrlType(request.url);
                 const pageNo = request.userData?.pageNo || 1;
-
-                crawlerLog.info(`Processing ${urlType} page: ${request.url}`);
 
                 // Handle search results
                 if (urlType === 'SEARCH') {
@@ -283,27 +329,20 @@ async function main() {
 
                     const remaining = RESULTS_WANTED - saved;
                     const toEnqueue = links.filter(l => !seenUrls.has(l)).slice(0, Math.max(0, remaining));
-                    
+
                     for (const link of toEnqueue) {
                         seenUrls.add(link);
                     }
-                    
+
                     if (toEnqueue.length) {
-                        await enqueueLinks({ 
-                            urls: toEnqueue, 
-                            userData: { label: 'DETAIL' } 
-                        });
+                        await enqueueLinks({ urls: toEnqueue, userData: { label: 'DETAIL' } });
                     }
 
-                    // Pagination
                     if (saved + toEnqueue.length < RESULTS_WANTED) {
                         const next = findNextPage($, request.url);
                         if (next && !seenUrls.has(next)) {
                             seenUrls.add(next);
-                            await enqueueLinks({ 
-                                urls: [next], 
-                                userData: { label: 'SEARCH', pageNo: pageNo + 1 } 
-                            });
+                            await enqueueLinks({ urls: [next], userData: { label: 'SEARCH', pageNo: pageNo + 1 } });
                         }
                     }
                     return;
@@ -317,11 +356,27 @@ async function main() {
                         // Try JSON-LD first
                         const jsonLdArray = extractJsonLd($);
                         let productData = extractProductFromJsonLd(jsonLdArray);
-                        
+
                         // Fallback to HTML parsing
                         if (!productData || !productData.product_name) {
-                            crawlerLog.info('JSON-LD extraction failed, falling back to HTML parsing');
                             productData = extractProductFromHtml($, request.url);
+                        }
+
+                        // Merge HTML data if JSON-LD is missing fields
+                        if (productData) {
+                            const htmlData = extractProductFromHtml($, request.url);
+                            if (!productData.lowest_price && htmlData.lowest_price) {
+                                productData.lowest_price = htmlData.lowest_price;
+                            }
+                            if (!productData.highest_price && htmlData.highest_price) {
+                                productData.highest_price = htmlData.highest_price;
+                            }
+                            if (!productData.offer_count && htmlData.offer_count) {
+                                productData.offer_count = htmlData.offer_count;
+                            }
+                            if (!productData.image_url && htmlData.image_url) {
+                                productData.image_url = htmlData.image_url;
+                            }
                         }
 
                         if (!productData || !productData.product_name) {
@@ -332,8 +387,7 @@ async function main() {
                         // Extract individual offers if requested
                         let offers = [];
                         if (collectOffers) {
-                            offers = extractOffersFromHtml($);
-                            crawlerLog.info(`Extracted ${offers.length} individual offers`);
+                            offers = extractOffersFromHtml($, request.url);
                         }
 
                         const item = {
@@ -355,25 +409,22 @@ async function main() {
 
                         await Dataset.pushData(item);
                         saved++;
-                        crawlerLog.info(`Saved product ${saved}/${RESULTS_WANTED}: ${productData.product_name}`);
+                        crawlerLog.info(`Saved ${saved}/${RESULTS_WANTED}: ${productData.product_name}`);
                     } catch (err) {
-                        crawlerLog.error(`Failed to extract from ${request.url}: ${err.message}`);
+                        crawlerLog.error(`Failed: ${err.message}`);
                     }
                 }
             },
-            async failedRequestHandler({ request, log: crawlerLog }) {
-                crawlerLog.error(`Request failed: ${request.url}`);
-            },
         });
 
-        await crawler.run(initial.map(u => ({ 
-            url: u, 
-            userData: { 
+        await crawler.run(initial.map(u => ({
+            url: u,
+            userData: {
                 label: getUrlType(u) === 'SEARCH' ? 'SEARCH' : 'DETAIL',
-                pageNo: 1 
-            } 
+                pageNo: 1
+            }
         })));
-        
+
         log.info(`Finished. Saved ${saved} products`);
     } finally {
         await Actor.exit();
