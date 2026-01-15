@@ -1,0 +1,53 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "product_name",
+          "brand",
+          "lowest_price",
+          "highest_price",
+          "offer_count",
+          "rating",
+          "product_url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "product_name": {
+            "label": "Product",
+            "format": "text"
+          },
+          "brand": {
+            "label": "Brand",
+            "format": "text"
+          },
+          "lowest_price": {
+            "label": "Lowest Price (€)",
+            "format": "number"
+          },
+          "highest_price": {
+            "label": "Highest Price (€)",
+            "format": "number"
+          },
+          "offer_count": {
+            "label": "Offers",
+            "format": "number"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "number"
+          },
+          "product_url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}
